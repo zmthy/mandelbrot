@@ -1,41 +1,126 @@
 ------------------------------------------------------------------------------
 module Main where
 
-import           Control.Monad (Monad ((>>=)), join, mzero)
-import           Data.Complex  (Complex ((:+)), magnitude)
+------------------------------------------------------------------------------
+import           Control.Monad               (Monad ((>>=)), join, mzero)
+import           Control.Parallel.Strategies (NFData, parBuffer)
+import qualified Control.Parallel.Strategies as P
+import           Data.Complex                (Complex ((:+)), magnitude)
+import           Data.List                   (find, isPrefixOf)
+import           Data.Monoid                 ((<>))
+import           Options.Applicative         hiding (helper)
+
+------------------------------------------------------------------------------
+import           Pnm
 
 
 ------------------------------------------------------------------------------
 main :: IO ()
-main = print (makeDataBw 240 135)
+main = join (execParser opts)
+  where
+    helper = abortOption ShowHelpText
+        ( long "help"
+       <> help "Show this help text" )
+    opts = info (helper <*> setup)
+        ( fullDesc
+       <> progDesc "Render a Mandelbrot fractal" )
 
 
 ------------------------------------------------------------------------------
-makeData :: ((Complex Double, Int) -> a) -> Double -> Int -> Int -> Int -> [a]
-makeData f limit iter w h =
-    map (f . mandelbrot limit iter . toComplexCoord w h) [0 .. w * h - 1]
+setup :: Parser (IO ())
+setup = makePNM
+    <$> option (str >>= readType)
+        ( long "mode"
+       <> metavar "b/w|grey|colour"
+       <> value BW
+       <> help "Rendering mode" )
+    <*> option auto
+        ( long "width"
+       <> short 'w'
+       <> metavar "WIDTH"
+       <> value 1920
+       <> help "Image width" )
+    <*> option auto
+        ( long "height"
+       <> short 'h'
+       <> metavar "HEIGHT"
+       <> value 1080
+       <> help "Image height" )
+  where
+    readType c = maybe mzero (return . snd) $
+        find (isPrefixOf c . fst) [("b/w",    BW),
+                                   ("grey",   Grey),
+                                   ("colour", Colour)]
 
+
+------------------------------------------------------------------------------
+data Mode = Colour | BW | Grey
+    deriving (Show, Eq)
+
+
+------------------------------------------------------------------------------
+makePNM :: Mode -> Int -> Int -> IO ()
+makePNM BW     w h = writePnm (makeDataBw w h)    255 (w, h)
+makePNM Grey   w h = writePnm (makeDataGray w h)  255 (w, h)
+makePNM Colour w h = writePnm (makeDataColor w h) 255 (w, h)
+
+
+------------------------------------------------------------------------------
 makeDataBw :: Int -> Int -> [Bool]
-makeDataBw = makeData ((> limit) . magnitude . fst) limit 1024
-  where limit = 2
+makeDataBw w h = parMap
+    ((> limit) . magnitude . fst . mandelbrot limit iter . toComplexCoord w h)
+    [0 .. w * h - 1]
+  where
+    limit = 2
+    iter  = 1024
 
 
 ------------------------------------------------------------------------------
-toColor:: Int -> (Complex Double, Int) -> (Int, Int, Int)
+makeDataGray :: Int -> Int -> [Gray]
+makeDataGray w h = parMap
+    (truncate . threshDiv limit . magnitude . fst .
+        mandelbrot limit iter . toComplexCoord w h)
+    [0 .. w * h - 1]
+  where
+    limit = 2
+    iter  = 1024
+
+
+------------------------------------------------------------------------------
+makeDataColor :: Int -> Int -> [Pixel]
+makeDataColor w h = parMap
+    (toColor iter . mandelbrot limit iter . toComplexCoord w h)
+    [0 .. w * h - 1]
+  where
+    limit = 2
+    iter = 1024
+
+
+------------------------------------------------------------------------------
+toColor:: Int -> (Complex Double, Int) -> Pixel
 toColor limit (z, i)
-    | magnitude z > 2 =
-      (truncate $ v * 255, truncate $ 125 * v + 125, truncate $ 75 + v * 75)
-    | otherwise = (255, 255, 255)
+    | magnitude z > 2 = Pixel
+                        (truncate $ v * 255)
+                        (truncate $ 125 * v + 125)
+                        (truncate $ 75 + v * 75)
+    | otherwise = Pixel 255 255 255
   where
     zn = magnitude z
     nu = logBase 2 (logBase 2 zn)
     iter = fromIntegral i + 1 - nu
     v = threshDiv (fromIntegral limit) iter
 
+
+------------------------------------------------------------------------------
 threshDiv :: Double -> Double -> Double
 threshDiv b a
-    | a > b = 255
+    | a > b     = 255
     | otherwise = a / b * 128
+
+
+------------------------------------------------------------------------------
+parMap :: NFData b => (a -> b) -> [a] -> [b]
+parMap f = P.withStrategy (parBuffer 100 P.rdeepseq) . map f
 
 
 ------------------------------------------------------------------------------
@@ -53,7 +138,8 @@ toComplexCoord w h i = scaleX xf :+ scaleY yf
 
 ------------------------------------------------------------------------------
 mandelbrot :: Double -> Int -> Complex Double -> (Complex Double, Int)
-mandelbrot limit iter v = foldl (mandelbrot' limit) (v, 0) $ replicate iter v
+mandelbrot limit iter v = mandelbrot' 0 v
   where
-    mandelbrot' limit l@(z, i) c | magnitude z < limit = (z * z + c, i + 1)
-                                 | otherwise = l
+    mandelbrot' i z@(x :+ y)
+        | i == iter || x * x + y * y >= limit * limit = (z, i)
+        | otherwise = mandelbrot' (succ i) (z * z + v)
